@@ -38,6 +38,9 @@ class PaperSummary:
     one_line: str
     origin: str
     authors: List[str]
+    venue: Optional[str]
+    published_at: Optional[str]
+    published_month: Optional[str]
     key_ideas: List[str]
     insights: List[dict]
     slides: List[SlideSpec]
@@ -80,6 +83,9 @@ def summarize_paper(
         one_line=raw.get("one_line", paper.summary[:150]),
         origin=raw.get("origin", "") or (paper.origin or ""),
         authors=paper.authors,
+        venue=paper.venue,
+        published_at=paper.published_date or paper.published_at,
+        published_month=paper.published_month,
         key_ideas=raw.get("key_ideas", []),
         insights=raw.get("insights", []),
         slides=slides,

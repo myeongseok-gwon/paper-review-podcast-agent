@@ -43,6 +43,26 @@ _NUMBER_PATTERNS = [
 ]
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass
 class _ExtractedItem:
     page: int
@@ -115,6 +135,31 @@ def _extract_number(block_type: str, caption_text: str) -> Optional[str]:
     return None
 
 
+def _expand_bbox(
+    bbox: Tuple[float, float, float, float],
+    img_width: int,
+    img_height: int,
+    pad_left_ratio: float,
+    pad_top_ratio: float,
+    pad_right_ratio: float,
+    pad_bottom_ratio: float,
+) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+
+    pad_left = width * pad_left_ratio
+    pad_top = height * pad_top_ratio
+    pad_right = width * pad_right_ratio
+    pad_bottom = height * pad_bottom_ratio
+
+    nx1 = max(0, int(round(x1 - pad_left)))
+    ny1 = max(0, int(round(y1 - pad_top)))
+    nx2 = min(img_width, int(round(x2 + pad_right)))
+    ny2 = min(img_height, int(round(y2 + pad_bottom)))
+    return nx1, ny1, nx2, ny2
+
+
 def _ensure_model(config_path: Path, weights_path: Path):
     try:
         import layoutparser as lp
@@ -122,9 +167,19 @@ def _ensure_model(config_path: Path, weights_path: Path):
         logging.warning("layoutparser missing; figure extraction skipped: %s", exc)
         return None
 
-    extra_config = ["MODEL.WEIGHTS", str(weights_path), "MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.7]
+    detectron_model_cls = getattr(lp, "Detectron2LayoutModel", None)
+    if detectron_model_cls is None:
+        # Some layoutparser builds do not expose this on top-level namespace.
+        try:
+            from layoutparser.models import Detectron2LayoutModel as detectron_model_cls  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            logging.warning("Detectron2LayoutModel unavailable in layoutparser: %s", exc)
+            return None
+
+    score_thresh = _float_env("PUBLAYNET_SCORE_THRESH", 0.6)
+    extra_config = ["MODEL.WEIGHTS", str(weights_path), "MODEL.ROI_HEADS.SCORE_THRESH_TEST", score_thresh]
     try:
-        return lp.Detectron2LayoutModel(str(config_path), label_map=_LABEL_MAP, extra_config=extra_config)
+        return detectron_model_cls(str(config_path), label_map=_LABEL_MAP, extra_config=extra_config)
     except Exception as exc:  # pragma: no cover - model load guard
         logging.warning("Failed to load PubLayNet model: %s", exc)
         return None
@@ -149,11 +204,11 @@ def _load_pdf(path: Path):
         return None
 
 
-def _to_image(page):
+def _to_image(page, dpi: int):
     import numpy as np
     import cv2
 
-    pix = page.get_pixmap(dpi=300)
+    pix = page.get_pixmap(dpi=dpi)
     if pix.n == 4:
         mode = cv2.COLOR_BGRA2RGB
     elif pix.n == 3:
@@ -168,14 +223,24 @@ def _to_image(page):
     return cv2.cvtColor(img, mode)
 
 
-def _extract_items(doc, model, assets_dir: Path) -> List[_ExtractedItem]:
+def _extract_items(doc, model, assets_dir: Path, dpi: int) -> List[_ExtractedItem]:
     import cv2
 
-    scale = 300 / 72
+    scale = dpi / 72
+    fig_pad_ratio = _float_env("FIGURE_CROP_PAD_RATIO", 0.08)
+    fig_pad_bottom_ratio = _float_env("FIGURE_CROP_PAD_BOTTOM_RATIO", 0.18)
+    table_pad_ratio = _float_env("TABLE_CROP_PAD_RATIO", 0.16)
+    table_pad_bottom_ratio = _float_env("TABLE_CROP_PAD_BOTTOM_RATIO", 0.28)
+    table_pad_top_ratio = _float_env("TABLE_CROP_PAD_TOP_RATIO", 0.18)
+    table_full_width_ratio = _float_env("TABLE_FULL_WIDTH_TRIGGER_RATIO", 0.78)
+    table_margin_ratio = _float_env("TABLE_FULL_WIDTH_MARGIN_RATIO", 0.04)
+    min_area_ratio = _float_env("FIGURE_MIN_AREA_RATIO", 0.0015)
+    min_side_px = _int_env("FIGURE_MIN_SIDE_PX", 40)
     items: List[_ExtractedItem] = []
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        img = _to_image(page)
+        img = _to_image(page, dpi)
+        img_h, img_w = img.shape[:2]
         layout = model.detect(img)
 
         text_blocks = []
@@ -188,13 +253,46 @@ def _extract_items(doc, model, assets_dir: Path) -> List[_ExtractedItem]:
                 continue
 
             x1, y1, x2, y2 = block.coordinates
-            crop = img[int(y1) : int(y2), int(x1) : int(x2)]
+            raw_w = max(1.0, x2 - x1)
+            if block.type == "Table":
+                bx1, by1, bx2, by2 = _expand_bbox(
+                    (x1, y1, x2, y2),
+                    img_width=img_w,
+                    img_height=img_h,
+                    pad_left_ratio=table_pad_ratio,
+                    pad_top_ratio=table_pad_top_ratio,
+                    pad_right_ratio=table_pad_ratio,
+                    pad_bottom_ratio=table_pad_bottom_ratio,
+                )
+                # Wide tables are often detected too tightly on the x-axis.
+                if (raw_w / img_w) >= table_full_width_ratio:
+                    margin = int(round(img_w * table_margin_ratio))
+                    bx1 = max(0, margin)
+                    bx2 = min(img_w, img_w - margin)
+            else:
+                bx1, by1, bx2, by2 = _expand_bbox(
+                    (x1, y1, x2, y2),
+                    img_width=img_w,
+                    img_height=img_h,
+                    pad_left_ratio=fig_pad_ratio,
+                    pad_top_ratio=fig_pad_ratio,
+                    pad_right_ratio=fig_pad_ratio,
+                    pad_bottom_ratio=fig_pad_bottom_ratio,
+                )
+            box_w = bx2 - bx1
+            box_h = by2 - by1
+            if box_w < min_side_px or box_h < min_side_px:
+                continue
+            if (box_w * box_h) < (img_w * img_h * min_area_ratio):
+                continue
+
+            crop = img[by1:by2, bx1:bx2]
             filename = f"page{page_idx + 1}_{block.type}_{i + 1}.png"
             assets_dir.mkdir(parents=True, exist_ok=True)
             dest = assets_dir / filename
             cv2.imwrite(str(dest), crop)
 
-            caption = _extract_caption(block.type, (x1, y1, x2, y2), text_blocks)
+            caption = _extract_caption(block.type, (bx1, by1, bx2, by2), text_blocks)
             number = _extract_number(block.type, caption)
             items.append(
                 _ExtractedItem(
@@ -246,8 +344,9 @@ def extract_pdf_figures(pdf_path: str, out_dir: Optional[str] = None) -> Optiona
     if not doc:
         return None
 
+    dpi = _int_env("FIGURE_RENDER_DPI", 350)
     try:
-        items = _extract_items(doc, model, assets_dir)
+        items = _extract_items(doc, model, assets_dir, dpi=dpi)
     except Exception as exc:  # pragma: no cover - runtime guard
         logging.warning("Figure extraction failed for %s: %s", pdf_path, exc)
         return None

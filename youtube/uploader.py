@@ -25,6 +25,21 @@ from googleapiclient.http import MediaFileUpload
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
+def _sanitize_youtube_title(raw_title: str) -> str:
+    # YouTube title must be non-empty and <= 100 chars.
+    collapsed = " ".join((raw_title or "").split()).strip().strip(' "“”')
+    if not collapsed:
+        return "Untitled"
+    if len(collapsed) > 100:
+        return collapsed[:100].rstrip()
+    return collapsed
+
+
+def _sanitize_youtube_description(raw_description: str, fallback_title: str) -> str:
+    cleaned = (raw_description or "").strip()
+    return cleaned if cleaned else f"{fallback_title}\n\nDescription not available."
+
+
 def get_youtube_client(client_secrets: str, token_file: str) -> Optional[any]:
     creds = None
     if os.path.exists(token_file):
@@ -47,15 +62,23 @@ def upload_video(
     tags: List[str],
     client_secrets: str,
     token_file: str,
+    privacy_status: str = "unlisted",
 ) -> Optional[str]:
     if not os.path.exists(video_path):
         logging.error("Video file not found: %s", video_path)
         return None
 
     youtube = get_youtube_client(client_secrets, token_file)
+    normalized_privacy = privacy_status.strip().lower()
+    if normalized_privacy not in {"public", "private", "unlisted"}:
+        logging.warning("Invalid YOUTUBE_PRIVACY_STATUS '%s'. Falling back to 'private'.", privacy_status)
+        normalized_privacy = "private"
+    safe_title = _sanitize_youtube_title(title)
+    safe_description = _sanitize_youtube_description(description, safe_title)
+
     body = {
-        "snippet": {"title": title, "description": description, "tags": tags, "categoryId": "28"},
-        "status": {"privacyStatus": "unlisted"},
+        "snippet": {"title": safe_title, "description": safe_description, "tags": tags, "categoryId": "28"},
+        "status": {"privacyStatus": normalized_privacy},
     }
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True)
     logging.info("Uploading video to YouTube...")

@@ -54,7 +54,7 @@ def audio_lang_dir(base_dir: str, date: str, lang: str, paper_id: Optional[str] 
 
 def video_path(base_dir: str, date: str, paper_id: Optional[str] = None) -> str:
     base = paper_dir(base_dir, date, paper_id) if paper_id else date_dir(base_dir, date)
-    return os.path.join(base, f"daily_papers_{date}.mp4")
+    return os.path.join(base, f"is_papers_review_{date}.mp4")
 
 
 def markdown_path(base_dir: str, date: str, paper_id: Optional[str] = None) -> str:
@@ -73,4 +73,4 @@ def scripts_path(base_dir: str, date: str, lang: str, paper_id: Optional[str] = 
 def video_lang_path(base_dir: str, date: str, lang: Optional[str], paper_id: Optional[str] = None) -> str:
     base = paper_dir(base_dir, date, paper_id) if paper_id else date_dir(base_dir, date)
     suffix = f"_{lang}" if lang else ""
-    return os.path.join(base, f"daily_papers_{date}{suffix}.mp4")
+    return os.path.join(base, f"is_papers_review_{date}{suffix}.mp4")

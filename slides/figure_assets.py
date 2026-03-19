@@ -25,6 +25,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 
 _REF_RE = re.compile(r"(?i)\b(fig(?:ure)?|table)\s*\.?\s*(\d+(?:\.\d+)*)")
+_TYPE_RE = re.compile(r"(?i)\b(fig(?:ure)?|table)\b")
+_PAGE_RE = re.compile(r"(?i)\b(?:page|p)\.?\s*(\d{1,4})\b")
 
 
 def _normalize_type(name: str) -> str:
@@ -41,6 +43,34 @@ def extract_reference(text: Optional[str]) -> Optional[Tuple[str, str]]:
     return _normalize_type(match.group(1)), match.group(2)
 
 
+def extract_reference_detail(text: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Return (type, number, page) from hints like 'Page 17, Table 5'."""
+    if not text:
+        return None, None, None
+
+    ref_type: Optional[str] = None
+    number: Optional[str] = None
+    page: Optional[int] = None
+
+    number_match = _REF_RE.search(text)
+    if number_match:
+        ref_type = _normalize_type(number_match.group(1))
+        number = number_match.group(2)
+    else:
+        type_match = _TYPE_RE.search(text)
+        if type_match:
+            ref_type = _normalize_type(type_match.group(1))
+
+    page_match = _PAGE_RE.search(text)
+    if page_match:
+        try:
+            page = int(page_match.group(1))
+        except ValueError:
+            page = None
+
+    return ref_type, number, page
+
+
 @dataclass
 class FigureAsset:
     path: Path
@@ -54,17 +84,43 @@ class FigureLibrary:
     def __init__(self, assets: Iterable[FigureAsset]):
         self.assets: List[FigureAsset] = list(assets)
         self._by_key: Dict[Tuple[str, str], FigureAsset] = {}
+        self._by_page_key: Dict[Tuple[int, str, str], FigureAsset] = {}
+        self._by_page_type: Dict[Tuple[int, str], List[FigureAsset]] = {}
         for asset in self.assets:
             if not asset.number:
+                if asset.page:
+                    page_type = (int(asset.page), _normalize_type(asset.asset_type))
+                    self._by_page_type.setdefault(page_type, []).append(asset)
                 continue
-            key = (_normalize_type(asset.asset_type), str(asset.number))
-            # keep the first occurrence per key
+            normalized_type = _normalize_type(asset.asset_type)
+            key = (normalized_type, str(asset.number))
             self._by_key.setdefault(key, asset)
 
-    def find(self, ref_type: Optional[str], number: Optional[str]) -> Optional[FigureAsset]:
-        if not (ref_type and number):
+            if asset.page is not None:
+                page_int = int(asset.page)
+                page_key = (page_int, normalized_type, str(asset.number))
+                self._by_page_key.setdefault(page_key, asset)
+                page_type = (page_int, normalized_type)
+                self._by_page_type.setdefault(page_type, []).append(asset)
+
+    def find(self, ref_type: Optional[str], number: Optional[str], page: Optional[int] = None) -> Optional[FigureAsset]:
+        if not ref_type:
             return None
-        return self._by_key.get((_normalize_type(ref_type), str(number)))
+        normalized_type = _normalize_type(ref_type)
+
+        if page is not None and number:
+            hit = self._by_page_key.get((int(page), normalized_type, str(number)))
+            if hit:
+                return hit
+
+        if number:
+            return self._by_key.get((normalized_type, str(number)))
+
+        if page is not None:
+            candidates = self._by_page_type.get((int(page), normalized_type), [])
+            if candidates:
+                return candidates[0]
+        return None
 
     def search_caption(self, needle: str) -> Optional[FigureAsset]:
         if not needle:

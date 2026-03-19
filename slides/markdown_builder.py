@@ -13,70 +13,122 @@
 # limitations under the License.
 
 import logging
+import os
 import re
 import shutil
+import unicodedata
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from llm.summarizer import DailyEpisode, PaperSummary, SlideSpec
-from slides.figure_assets import FigureAsset, FigureLibrary, extract_reference, rewrite_caption
+from llm.summarizer import DailyEpisode, SlideSpec
+from slides.figure_assets import FigureAsset, FigureLibrary, extract_reference_detail, rewrite_caption
+
+DEFAULT_EMBED_IMAGE_WIDTH_WITH_TEXT = "90%"
+DEFAULT_EMBED_IMAGE_WIDTH_VISUAL_ONLY = "92%"
+DEFAULT_MAX_IMAGE_HEIGHT_WITH_TEXT = "54vh"
+DEFAULT_MAX_IMAGE_HEIGHT_VISUAL_ONLY = "68vh"
+DEFAULT_OCR_ROTATE_MIN_CONFIDENCE = 8.0
+
+_OCR_BACKEND_UNAVAILABLE_LOGGED = False
+
+
+def _sanitize_markdown_text(text: str) -> str:
+    """Make text safe for Slidev/Vue markdown rendering.
+
+    - Unwrap common LaTeX-style macros like \textsc{AI} -> AI.
+    - Remove remaining curly braces to avoid Vue moustache parsing ({{ ... }}).
+    """
+    value = text or ""
+
+    # Repeatedly unwrap simple latex commands.
+    prev = None
+    while prev != value:
+        prev = value
+        value = re.sub(r"\\[A-Za-z]+\{([^{}]*)\}", r"\1", value)
+
+    # Remove any remaining braces to prevent Vue interpolation parse errors.
+    value = value.replace("{", "").replace("}", "")
+    return " ".join(value.split()).strip()
 
 
 def _clean_origin(text: str) -> str:
     return text.strip().strip(' "“”') if text else ""
 
 
-def _add_slide(
-    lines: List[str],
-    scripts: List[str],
-    body: str,
-    script: str,
-) -> None:
-    lines.append(body.strip())
-    lines.append("")
-    lines.append("---")
-    scripts.append(script.strip())
+def _month_label(month_raw: str) -> str:
+    text = (month_raw or "").strip().lower().strip("{}")
+    month_map = {
+        "jan": "Jan",
+        "feb": "Feb",
+        "mar": "Mar",
+        "apr": "Apr",
+        "may": "May",
+        "jun": "Jun",
+        "jul": "Jul",
+        "aug": "Aug",
+        "sep": "Sep",
+        "sept": "Sep",
+        "oct": "Oct",
+        "nov": "Nov",
+        "dec": "Dec",
+    }
+    return month_map.get(text, month_raw or "")
 
 
-def _inline_markdown_to_html(text: str) -> str:
-    """
-    마크다운 스타일링 개선:
-    **bold** -> 단순히 굵게가 아니라 포인트 컬러를 적용한 strong 태그
-    *italic* -> em 태그
-    """
-    # bold (색상 강조를 위해 class 추가 가능, 여기선 CSS에서 strong 태그 자체를 스타일링함)
-    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
-    # italic
-    text = re.sub(r"\*(.+?)\*", r"<em>\1</em>", text)
-    return text
+def _authors_for_slide(authors: List[str]) -> str:
+    cleaned = [_normalize_author_text(a) for a in (authors or []) if a and a.strip()]
+    return ", ".join(cleaned) if cleaned else "n/a"
 
 
-def _list_to_html(bullets: List[str]) -> str:
-    if not bullets:
-        return ""
-    items = "".join(f"<li>{_inline_markdown_to_html(b)}</li>" for b in bullets)
-    return f"<ul>{items}</ul>"
+def _format_slidev_date(date_text: str) -> str:
+    try:
+        return datetime.strptime((date_text or "").strip(), "%Y-%m-%d").strftime("%Y/%m/%d")
+    except ValueError:
+        return date_text
 
 
-def _text_slide_body(
-    title: str,
-    bullets: List[str],
-    prefix: Optional[str] = None,
-) -> str:
-    full_title = f"{prefix} {title}" if prefix else title
-    # 헤더에 그라데이션 라인 효과 등을 주기 위해 구조 유지
-    header = (
-        '<div class="slide-header">'
-        f"<h1>{_inline_markdown_to_html(full_title)}</h1>"
-        "</div>"
-    )
-    list_html = _list_to_html(bullets)
-    content = (
-        '<div class="slide-content">'
-        f'<div class="text text-only">{list_html}</div>'
-        "</div>"
-    )
-    return f'<div class="slide">{header}{content}</div>'
+def _normalize_author_text(text: str) -> str:
+    value = text or ""
+    # Handle common LaTeX accent notations such as F{\"u}gener.
+    value = re.sub(r'\{\\["\'`^~=.uvHcbdkrt]\s*([A-Za-z])\}', r"\1", value)
+    value = re.sub(r'\\["\'`^~=.uvHcbdkrt]\s*([A-Za-z])', r"\1", value)
+    value = value.replace("{", "").replace("}", "").replace("\\", "")
+    value = " ".join(value.split()).strip()
+    return value
+
+
+def _strip_diacritics(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch))
+
+
+def _first_author_display(authors: List[str]) -> str:
+    cleaned = [a.strip() for a in (authors or []) if a and a.strip()]
+    cleaned = [_normalize_author_text(a) for a in cleaned]
+    if not cleaned:
+        return "Unknown Author"
+
+    first = cleaned[0]
+    if len(cleaned) == 1:
+        return _strip_diacritics(first)
+
+    if "," in first:
+        family = first.split(",", 1)[0].strip()
+    else:
+        parts = first.split()
+        family = parts[-1] if parts else first
+    return f"{_strip_diacritics(family)} et al."
+
+
+def _theme_reference(out_path: str) -> str:
+    out_dir = Path(out_path).resolve().parent
+    theme_dir = Path(__file__).resolve().parents[1] / "slidev-theme-umn"
+    rel = os.path.relpath(theme_dir.as_posix(), start=out_dir.as_posix())
+    rel_posix = rel.replace("\\", "/")
+    if rel_posix.startswith("."):
+        return rel_posix
+    return f"./{rel_posix}"
 
 
 def _resolve_figure_asset(
@@ -87,9 +139,9 @@ def _resolve_figure_asset(
         return None
 
     if slide.figure_hint:
-        ref = extract_reference(slide.figure_hint)
-        if ref:
-            asset = figure_library.find(*ref)
+        ref_type, number, page = extract_reference_detail(slide.figure_hint)
+        if ref_type:
+            asset = figure_library.find(ref_type, number, page=page)
             if asset:
                 return asset
 
@@ -99,12 +151,68 @@ def _resolve_figure_asset(
     return None
 
 
+def _auto_rotate_image_by_ocr(image_path: Path) -> None:
+    """Rotate image to upright orientation using OCR orientation detection."""
+    global _OCR_BACKEND_UNAVAILABLE_LOGGED
+
+    try:
+        import cv2  # type: ignore
+        import pytesseract  # type: ignore
+    except Exception:
+        if not _OCR_BACKEND_UNAVAILABLE_LOGGED:
+            logging.warning(
+                "OCR auto-rotate requested but pytesseract/cv2 is unavailable. "
+                "Install tesseract + pytesseract to enable this feature."
+            )
+            _OCR_BACKEND_UNAVAILABLE_LOGGED = True
+        return
+
+    try:
+        img = cv2.imread(image_path.as_posix(), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return
+
+        osd = pytesseract.image_to_osd(img)
+        rotate_match = re.search(r"Rotate:\s*(\d+)", osd)
+        conf_match = re.search(r"Orientation confidence:\s*([0-9.]+)", osd, flags=re.IGNORECASE)
+        if not rotate_match:
+            return
+
+        rotate_deg = int(rotate_match.group(1)) % 360
+        confidence = float(conf_match.group(1)) if conf_match else 0.0
+        if confidence < DEFAULT_OCR_ROTATE_MIN_CONFIDENCE:
+            return
+
+        rotated = None
+        if rotate_deg == 90:
+            rotated = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_deg == 180:
+            rotated = cv2.rotate(img, cv2.ROTATE_180)
+        elif rotate_deg == 270:
+            rotated = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+        if rotated is None:
+            return
+
+        cv2.imwrite(image_path.as_posix(), rotated)
+        logging.info(
+            "OCR auto-rotated image %s by %d degrees (confidence=%.2f)",
+            image_path,
+            rotate_deg,
+            confidence,
+        )
+    except Exception as exc:
+        # Best effort only.
+        logging.debug("OCR auto-rotate skipped for %s: %s", image_path, exc)
+
+
 def _attach_figure_to_slide(
     slide: SlideSpec,
     asset: Optional[FigureAsset],
     out_dir: Path,
     paper_idx: int,
     slide_idx: int,
+    auto_rotate_by_ocr: bool = False,
 ) -> None:
     if not asset:
         return
@@ -124,58 +232,114 @@ def _attach_figure_to_slide(
         logging.warning("Failed to copy figure asset %s -> %s: %s", asset.path, dest, exc)
         return
 
+    if auto_rotate_by_ocr and str(asset.asset_type).lower().startswith("table"):
+        _auto_rotate_image_by_ocr(dest)
+
     slide.figure_image = dest.resolve().as_posix()
-    slide.figure_caption = rewrite_caption(asset, slide.figure_hint)
+    slide.figure_caption = rewrite_caption(asset, slide.figure_hint, max_len=90)
 
 
-def _llm_slide_body(idx: int, slide_idx: int, slide: SlideSpec, single_pdf_mode: bool) -> str:
-    bullets_html = ""
+def _image_style_for_slide(slide: SlideSpec) -> str:
+    return (
+        "max-height:100% !important; "
+        "max-width:100% !important; "
+        "height:auto !important; "
+        "width:auto !important; "
+        "display:block; "
+        "object-fit:contain;"
+    )
+
+
+def _image_container_style_for_slide(slide: SlideSpec) -> str:
+    has_text = bool(slide.bullets)
+    max_h = DEFAULT_MAX_IMAGE_HEIGHT_WITH_TEXT if has_text else DEFAULT_MAX_IMAGE_HEIGHT_VISUAL_ONLY
+    max_w = DEFAULT_EMBED_IMAGE_WIDTH_WITH_TEXT if has_text else DEFAULT_EMBED_IMAGE_WIDTH_VISUAL_ONLY
+    return (
+        f"height:{max_h}; "
+        f"max-width:{max_w}; "
+        "width:100%; "
+        "margin:6px auto 8px auto; "
+        "display:flex; "
+        "align-items:center; "
+        "justify-content:center; "
+        "overflow:hidden;"
+    )
+
+
+def _llm_slide_body(_idx: int, _slide_idx: int, slide: SlideSpec, _single_pdf_mode: bool) -> str:
+    safe_title = _sanitize_markdown_text(slide.title)
+    lines: List[str] = [f"# {safe_title}"]
+
     if slide.bullets:
-        items = "".join(
-            f"<li>{_inline_markdown_to_html(b)}</li>" for b in slide.bullets
-        )
-        bullets_html = f"<ul>{items}</ul>"
-
-    label = f"{slide_idx}" if single_pdf_mode else f"{idx}.{slide_idx}"
-    # 숫자 라벨을 작고 세련되게 표시하기 위해 span으로 감쌈
-    header_html = f'<span class="slide-number">{label}</span> {_inline_markdown_to_html(slide.title)}'
-    header = f'<div class="slide-header"><h1>{header_html}</h1></div>'
-    
-    content = ""
+        lines.append("")
+        for bullet in slide.bullets:
+            lines.append(f"- {_sanitize_markdown_text(bullet)}")
 
     if slide.figure_image:
-        caption = slide.figure_caption or slide.figure_hint or ""
-        caption_html = _inline_markdown_to_html(caption) if caption else ""
-        alt = caption or f"Slide {idx}.{slide_idx} figure"
+        caption = _sanitize_markdown_text((slide.figure_caption or slide.figure_hint or "Figure").strip())
+        img_style = _image_style_for_slide(slide)
+        container_style = _image_container_style_for_slide(slide)
+        lines.append("")
+        lines.append(f'<div style="{container_style}">')
+        lines.append(f'<img src="{slide.figure_image}" alt="{caption}" style="{img_style}"/>')
+        lines.append("</div>")
 
-        if not slide.bullets:
-            # Full figure slide
-            figure_block = (
-                '<div class="figure-only">'
-                f'<figure class="media featured">'
-                f'<div class="img-wrapper"><img src="{slide.figure_image}" alt="{alt}" /></div>'
-            )
-            if caption_html:
-                figure_block += f"<figcaption>{caption_html}</figcaption>"
-            figure_block += "</figure></div>"
-            content = figure_block
-        else:
-            # Split layout
-            figure_block = (
-                '<div class="split">'
-                f'<div class="text">{bullets_html}</div>'
-                '<figure class="media">'
-                f'<div class="img-wrapper"><img src="{slide.figure_image}" alt="{alt}" /></div>'
-            )
-            if caption_html:
-                figure_block += f"<figcaption>{caption_html}</figcaption>"
-            figure_block += "</figure></div>"
-            content = figure_block
-    else:
-        # Text only
-        content = f'<div class="text text-only">{bullets_html}</div>'
+    return "\n".join(lines)
 
-    return f'<div class="slide">{header}<div class="slide-content">{content}</div></div>'
+
+def _asset_label(asset: FigureAsset) -> str:
+    base = f"{asset.asset_type} {asset.number}" if asset.number else str(asset.asset_type)
+    if asset.page is not None:
+        return f"{base} (p{asset.page})"
+    return base
+
+
+def _append_unused_assets_as_slides(
+    *,
+    paper_idx: int,
+    paper_slide_count: int,
+    paper_library: Optional[FigureLibrary],
+    used_asset_paths: set[str],
+    out_dir: Path,
+    single_pdf_mode: bool,
+    auto_rotate_by_ocr: bool,
+    slide_blocks: List[str],
+    scripts: List[str],
+) -> int:
+    if not paper_library:
+        return 0
+
+    appended = 0
+    next_slide_idx = paper_slide_count + 1
+    for asset in paper_library.assets:
+        key = asset.path.resolve().as_posix()
+        if key in used_asset_paths:
+            continue
+
+        title = f"Appendix: {_asset_label(asset)}"
+        slide = SlideSpec(
+            title=title,
+            bullets=[],
+            script=f"Let's quickly review {_asset_label(asset)}.",
+            figure_hint=title,
+        )
+        _attach_figure_to_slide(
+            slide,
+            asset,
+            out_dir,
+            paper_idx,
+            next_slide_idx,
+            auto_rotate_by_ocr=auto_rotate_by_ocr,
+        )
+        if not slide.figure_image:
+            continue
+
+        slide_blocks.append(_llm_slide_body(paper_idx, next_slide_idx, slide, single_pdf_mode).strip())
+        scripts.append(slide.script.strip())
+        used_asset_paths.add(key)
+        appended += 1
+        next_slide_idx += 1
+    return appended
 
 
 def build_daily_markdown(
@@ -183,282 +347,129 @@ def build_daily_markdown(
     out_path: str,
     figure_libraries: Optional[Dict[str, FigureLibrary]] = None,
     single_pdf_mode: bool = False,
+    auto_rotate_by_ocr: bool = False,
 ) -> List[str]:
     """
-    Build Marp markdown with enhanced modern CSS styling.
+    Build Slidev markdown in a simple, theme-friendly format.
     """
     out_dir = Path(out_path).parent
-    
-    # --- Modern CSS Design Definition ---
-    css_lines = [
-        "  :root {",
-        "    --primary-color: #2563eb;",       # Royal Blue
-        "    --secondary-color: #64748b;",     # Slate Gray
-        "    --accent-color: #3b82f6;",        # Lighter Blue
-        "    --text-color: #1f2937;",          # Dark Gray (not pure black)
-        "    --bg-color: #ffffff;",
-        "    --code-bg: #f1f5f9;",
-        "    --slide-max-width: 1120px;",
-        "    --slide-font-size: 1.1em;",       # 폰트 사이즈 약간 키움
-        "    --shadow-soft: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);",
-        "    --radius-md: 12px;",
-        "  }",
-        "",
-        "  section {",
-        "    background-color: var(--bg-color);",
-        "    color: var(--text-color);",
-        "    position: relative;",
-        "    padding: 40px 60px;",             # 여백 조정
-        "    box-sizing: border-box;",
-        "    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;",
-        "    letter-spacing: -0.01em;",
-        "  }",
-        "",
-        "  /* --- Header Styling --- */",
-        "  .slide-header {",
-        "    position: sticky;",
-        "    top: 0;",
-        "    background: rgba(255, 255, 255, 0.95);", # 살짝 투명하게
-        "    padding-bottom: 20px;",
-        "    z-index: 10;",
-        "    border-bottom: 3px solid var(--primary-color);", # 단순 선 대신 포인트 컬러 바
-        "    margin-bottom: 24px;",
-        "  }",
-        "",
-        "  .slide-header h1 {",
-        "    margin: 0;",
-        "    font-size: 1.5em;",
-        "    font-weight: 700;",
-        "    color: var(--primary-color);",
-        "    line-height: 1.2;",
-        "    display: flex;",
-        "    align-items: center;",
-        "    gap: 12px;",
-        "  }",
-        "",
-        "  .slide-number {",
-        "    background: var(--primary-color);",
-        "    color: white;",
-        "    font-size: 0.6em;",
-        "    padding: 2px 8px;",
-        "    border-radius: 6px;",
-        "    vertical-align: middle;",
-        "    font-weight: 600;",
-        "  }",
-        "",
-        "  /* --- Layout & Content --- */",
-        "  .slide {",
-        "    display: flex;",
-        "    flex-direction: column;",
-        "    height: 100%;",
-        "  }",
-        "",
-        "  .slide-content {",
-        "    flex: 1;",
-        "    display: flex;",
-        "    flex-direction: column;",
-        "    justify-content: center;", # 내용 수직 중앙 정렬 기본
-        "  }",
-        "",
-        "  /* --- Typography --- */",
-        "  strong {",
-        "    color: var(--primary-color);",
-        "    font-weight: 700;",
-        "  }",
-        "",
-        "  em {",
-        "    color: var(--secondary-color);",
-        "    font-style: italic;",
-        "  }",
-        "",
-        "  /* --- Lists --- */",
-        "  .text ul {",
-        "    padding-left: 0;",
-        "    margin: 0;",
-        "    list-style: none;", # 기본 불릿 제거
-        "  }",
-        "",
-        "  .text li {",
-        "    position: relative;",
-        "    padding-left: 24px;",
-        "    margin-bottom: 14px;",
-        "    line-height: 1.6;",
-        "    font-size: 1.0em;",
-        "  }",
-        "",
-        "  .text li::before {", # 커스텀 불릿
-        "    content: '•';",
-        "    color: var(--primary-color);",
-        "    font-weight: bold;",
-        "    position: absolute;",
-        "    left: 0;",
-        "    font-size: 1.2em;",
-        "    line-height: 1.5;",
-        "  }",
-        "",
-        "  .text-only {",
-        "    font-size: 1.1em;",
-        "    max-height: 75vh;",
-        "    overflow-y: auto;",
-        "  }",
-        "",
-        "  /* --- Images & Media --- */",
-        "  .media {",
-        "    display: flex;",
-        "    flex-direction: column;",
-        "    align-items: center;",
-        "    width: 100%;",
-        "  }",
-        "",
-        "  .img-wrapper {",
-        "    background: white;",
-        "    padding: 8px;",
-        "    border-radius: var(--radius-md);",
-        "    box-shadow: var(--shadow-soft);",
-        "    border: 1px solid #e5e7eb;",
-        "    display: inline-block;",
-        "  }",
-        "",
-        "  .media img {",
-        "    max-width: 100%;",
-        "    max-height: 60vh;",
-        "    object-fit: contain;",
-        "    border-radius: 6px;", # wrapper 내부 이미지도 살짝 둥글게
-        "    display: block;",
-        "  }",
-        "",
-        "  .media figcaption {",
-        "    font-size: 0.85em;",
-        "    color: var(--secondary-color);",
-        "    margin-top: 12px;",
-        "    text-align: center;",
-        "    font-weight: 500;",
-        "    background: #f8fafc;",
-        "    padding: 4px 12px;",
-        "    border-radius: 20px;",
-        "    display: inline-block;",
-        "  }",
-        "",
-        "  /* --- Featured (Image Only) --- */",
-        "  .figure-only {",
-        "    height: 100%;",
-        "    display: flex;",
-        "    align-items: center;",
-        "    justify-content: center;",
-        "  }",
-        "",
-        "  .figure-only .img-wrapper {",
-        "    padding: 12px;",
-        "    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);",
-        "  }",
-        "",
-        "  .media.featured img {",
-        "    max-height: 70vh;",
-        "  }",
-        "",
-        "  /* --- Split Layout --- */",
-        "  .split {",
-        "    display: flex;",
-        "    gap: 32px;",
-        "    align-items: center;", # 수직 중앙 정렬
-        "    height: 100%;",
-        "  }",
-        "",
-        "  .split .text {",
-        "    flex: 1;",
-        "    font-size: 0.95em;",
-        "  }",
-        "",
-        "  .split figure {",
-        "    flex: 1.2;", # 이미지를 조금 더 넓게
-        "    margin: 0;",
-        "  }",
-        "",
-        "  .figure-hint {",
-        "    margin-top: 16px;",
-        "    font-size: 0.85em;",
-        "    color: #d97706;", # Amber color for hints
-        "    background: #fffbeb;",
-        "    padding: 8px 12px;",
-        "    border-radius: 6px;",
-        "    border-left: 4px solid #d97706;",
-        "  }",
-        "",
-        "  /* --- Responsive --- */",
-        "  @media (max-width: 900px) {",
-        "    .split { flex-direction: column; }",
-        "    .slide-header { position: relative; }",
-        "  }",
-    ]
-
+    formatted_date = _format_slidev_date(daily.date)
+    cover_authors = daily.papers[0].authors if daily.papers else []
+    center_author = _first_author_display(cover_authors)
+    theme_ref = _theme_reference(out_path)
     lines: List[str] = [
         "---",
-        "marp: true",
-        "paginate: true",
-        f'title: "Daily AI Papers - {daily.date}"',
-        "style: |",
-    ] + css_lines + [
+        f'theme: "{theme_ref}"',
+        "colorSchema: auto",
+        'author: "Myeongseok (Edgar) Gwon"',
+        f'title: "{center_author}"',
+        f'date: "{formatted_date}"',
+        "transition: slide-left",
         "---",
         "",
     ]
-    
+
+    slide_blocks: List[str] = []
     scripts: List[str] = []
 
-    # Intro slide (HTML로)
     if single_pdf_mode and daily.papers:
         paper = daily.papers[0]
-        origin = _clean_origin(paper.origin)
-        bullets = [
-            f"**Title**: {paper.title}",
-            "NLP 코기",
-        ]
-        if origin:
-            bullets.insert(1, f"**Affiliation**: {origin}")
-        
-        # 인트로 슬라이드용 별도 제목 (더 크게)
-        intro_body = _text_slide_body("꼬리의 꼬리를 무는<br>페이퍼 딥다이브", bullets)
-        origin_phrase = f"{origin}에서 나온 " if origin else ""
+        venue = _clean_origin(getattr(paper, "venue", ""))
+        year = _clean_origin(getattr(paper, "published_at", ""))
+        month = _month_label(_clean_origin(getattr(paper, "published_month", "")))
+        pub_date = " ".join(part for part in [month, year] if part).strip() or "n/a"
+        intro_body = "\n".join(
+            [
+                f"# {_sanitize_markdown_text(paper.title)}",
+                "",
+                f"## {_authors_for_slide(getattr(paper, 'authors', []))}",
+                "",
+                f"## {venue or 'n/a'}, {pub_date}",
+            ]
+        )
         intro_script = (
-            f"안녕하세요. NLP 코기입니다. "
-            f"오늘의 꼬리의 꼬리를 무는 페이퍼 딥다이브, 꼬꼬페에서 다룰 내용은 {origin_phrase}{paper.title}입니다."
+            f"안녕하세요. IS Edgar입니다. "
+            f"오늘의 꼬리의 꼬리를 무는 페이퍼 딥다이브, 꼬꼬페에서 다룰 내용은 {paper.title}입니다."
         )
     else:
-        intro_bullets = [
-            f"**Date**: {daily.date}",
-            "**Source**: Hugging Face Daily Papers",
-            f"**Papers**: {len(daily.papers)} Papers Included",
-        ]
-        intro_body = _text_slide_body("Daily AI Papers", intro_bullets)
+        intro_body = "\n".join(
+            [
+                "# Information Systems Paper Review",
+                "",
+                "## Myeongseok (Edgar) Gwon",
+                "",
+                f"### Weekly ISSS, {formatted_date}",
+                "",
+                f"## {len(daily.papers)} paper(s) from local PDF collection",
+            ]
+        )
         intro_script = (
-            f"Hi Everyone. This is NLP Corgi. "
-            f"Daily AI Papers for {daily.date}. "
-            f"This episode covers {len(daily.papers)} papers from Hugging Face Daily Papers."
+            f"Hi Everyone. This is IS Edgar. "
+            f"Information Systems paper review for {daily.date}. "
+            f"This episode covers {len(daily.papers)} papers from local PDF inputs."
         )
 
-    _add_slide(
-        lines,
-        scripts,
-        intro_body,
-        intro_script,
-    )
+    slide_blocks.append(intro_body.strip())
+    scripts.append(intro_script.strip())
 
     for idx, paper in enumerate(daily.papers, 1):
         paper_library = figure_libraries.get(paper.paper_id) if figure_libraries else None
+        used_asset_paths: set[str] = set()
 
         for slide_idx, slide in enumerate(paper.slides, 1):
             asset = _resolve_figure_asset(slide, paper_library)
-            _attach_figure_to_slide(slide, asset, out_dir, idx, slide_idx)
-            _add_slide(
-                lines,
-                scripts,
-                _llm_slide_body(idx, slide_idx, slide, single_pdf_mode),
-                slide.script or " ".join(slide.bullets),
+            _attach_figure_to_slide(
+                slide,
+                asset,
+                out_dir,
+                idx,
+                slide_idx,
+                auto_rotate_by_ocr=auto_rotate_by_ocr,
             )
+            if asset:
+                used_asset_paths.add(asset.path.resolve().as_posix())
+            slide_blocks.append(_llm_slide_body(idx, slide_idx, slide, single_pdf_mode).strip())
+            scripts.append((slide.script or " ".join(slide.bullets)).strip())
 
-    if lines and lines[-1] == "---":
-        lines.pop()
+        appended = _append_unused_assets_as_slides(
+            paper_idx=idx,
+            paper_slide_count=len(paper.slides),
+            paper_library=paper_library,
+            used_asset_paths=used_asset_paths,
+            out_dir=out_dir,
+            single_pdf_mode=single_pdf_mode,
+            auto_rotate_by_ocr=auto_rotate_by_ocr,
+            slide_blocks=slide_blocks,
+            scripts=scripts,
+        )
+        if appended:
+            logging.info("Appended %d unused figure/table slides for %s", appended, paper.paper_id)
 
-    with open(out_path, "w") as f:
+    slide_blocks.append(
+        "\n".join(
+            [
+                "section: Final words",
+                "layout: center",
+                'class: "text-center"',
+                "---",
+                "",
+                "# Thank you!",
+            ]
+        ).strip()
+    )
+    scripts.append("Thank you for watching. See you in the next paper review.")
+
+    normalized_blocks = [block for block in slide_blocks if block]
+    if normalized_blocks:
+        merged = normalized_blocks[0]
+        for block in normalized_blocks[1:]:
+            if block.startswith("section:"):
+                merged += "\n\n---\n" + block
+            else:
+                merged += "\n\n---\n\n" + block
+        lines.append(merged)
+
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
     return scripts

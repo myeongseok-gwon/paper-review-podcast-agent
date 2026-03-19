@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -44,17 +45,19 @@ def _ensure_packages_distributions() -> None:
 _ensure_packages_distributions()
 
 from config import Config, load_config
-from daily_papers.hf_client import fetch_daily_papers, resolve_arxiv_and_pdf
+from daily_papers.doi_utils import doi_url, normalize_doi
 from daily_papers.models import HFPaperEntry
-from daily_papers.pdf_downloader import download_pdf
+from daily_papers.pdf_downloader import stage_local_pdf
 from daily_papers.pdf_parser import extract_core_text
+from daily_papers.pdf_preprocessor import strip_pdf_annotations
+from daily_papers.zotero_bib import find_entry_by_doi
 from llm.client import LLMClient
-from llm.summarizer import DailyEpisode, PaperSummary, summarize_paper
+from llm.summarizer import DailyEpisode, PaperSummary, SlideSpec, summarize_paper
 from llm.translator import language_display, translate_scripts
-from slides.figure_assets import FigureLibrary, load_figure_library, summarize_assets
+from slides.figure_assets import FigureAsset, FigureLibrary, load_figure_library, summarize_assets
 from slides.figure_extractor import extract_pdf_figures
 from slides.markdown_builder import build_daily_markdown
-from slides.marp_renderer import render_markdown_to_images
+from slides.slidev_renderer import render_markdown_to_images
 from storage import paths
 from tts.client import TTSClient
 from video.builder import build_video
@@ -62,36 +65,108 @@ from youtube.uploader import upload_video
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Daily AI Papers → YouTube automation")
+    parser = argparse.ArgumentParser(description="Local PDF paper review video automation")
     parser.add_argument("--date", help="Target date (YYYY-MM-DD). Defaults to today.")
-    parser.add_argument("--top-k", type=int, dest="top_k", help="How many papers to include.")
     parser.add_argument(
         "--languages",
-        help="Comma-separated narration languages (e.g., en,ko). Defaults to LANGUAGES env/config.",
+        help="Comma-separated narration languages (e.g., en). Defaults to LANGUAGES env/config.",
     )
-    parser.add_argument("--pdf-url", help="Process a single PDF by URL (bypasses Daily Papers fetch).")
-    parser.add_argument("--paper-id", help="Optional paper id when using --pdf-url.")
-    parser.add_argument("--paper-title", help="Optional paper title when using --pdf-url.")
-    parser.add_argument("--origin", help="Optional origin/affiliation override for single PDF mode.")
-    parser.add_argument("--skip-render", action="store_true", help="Skip marp slide rendering.")
+    parser.add_argument("--doi", help='Process by DOI from Better BibTeX (e.g., "10.1287/isre.2022.0152").')
+    parser.add_argument("--zotero-bib", help="Path to Better BibTeX .bib file.")
+    parser.add_argument("--pdf-path", help="Process a single local PDF file.")
+    parser.add_argument("--input-dir", help="Process all PDF files in a local directory.")
+    parser.add_argument("--paper-id", help="Optional custom identifier for --pdf-path mode.")
+    parser.add_argument("--paper-title", help="Optional custom title for --pdf-path mode.")
+    parser.add_argument("--origin", help="Optional origin/affiliation override.")
+    parser.add_argument(
+        "--strip-pdf-annotations",
+        dest="strip_pdf_annotations",
+        action="store_true",
+        default=True,
+        help="Strip PDF annotations before text/figure extraction (default: enabled).",
+    )
+    parser.add_argument(
+        "--keep-pdf-annotations",
+        dest="strip_pdf_annotations",
+        action="store_false",
+        help="Keep original PDF annotations during text/figure extraction.",
+    )
+    parser.add_argument("--skip-render", action="store_true", help="Skip Slidev slide rendering.")
     parser.add_argument("--skip-tts", action="store_true", help="Skip TTS generation.")
     parser.add_argument("--skip-video", action="store_true", help="Skip video rendering.")
-    parser.add_argument("--skip-upload", action="store_true", help="Skip YouTube upload.")
+    parser.add_argument("--skip-upload", action="store_true", help="Skip YouTube upload (legacy flag).")
+    parser.add_argument("--upload", dest="upload", action="store_true", default=True, help="Enable YouTube upload (default: enabled).")
+    parser.add_argument("--no-upload", dest="upload", action="store_false", help="Disable YouTube upload.")
     parser.add_argument("--video-only", action="store_true", help="Produce video locally and skip YouTube upload.")
+    parser.add_argument(
+        "--debug-figure-layout",
+        action="store_true",
+        help=(
+            "Debug mode: skip LLM/TTS/video/upload, extract figure/table assets only, and build "
+            "template slides (image-only + 3-bullet+image) for every extracted asset."
+        ),
+    )
+    parser.add_argument(
+        "--auto-rotate-by-ocr",
+        action="store_true",
+        help="Use OCR orientation detection to auto-rotate extracted table images before slide embedding.",
+    )
     return parser.parse_args()
 
 
-def build_description(papers: List[Any], base_url: str) -> str:
-    lines = ["Daily AI Papers", "", "Source: Hugging Face Daily Papers", ""]
+def build_description(papers: List[Any]) -> str:
+    lines = ["Information Systems Paper Review", "", "Source: Local PDF inputs", ""]
     for idx, paper in enumerate(papers, 1):
         title = getattr(paper, "title", "Untitled")
         authors = ", ".join(getattr(paper, "authors", []))
-        link = getattr(paper, "arxiv_url", "") or getattr(paper, "hf_url", "") or base_url
+        link = getattr(paper, "source_url", "") or doi_url(getattr(paper, "doi", "")) or "n/a"
+        venue = getattr(paper, "venue", "") or "n/a"
+        published_date = getattr(paper, "published_date", "") or getattr(paper, "published_at", "") or "n/a"
         lines.append(f"{idx}. {title}")
         lines.append(f"   - Authors: {authors}")
+        lines.append(f"   - Venue: {venue}")
+        lines.append(f"   - Published: {published_date}")
         lines.append(f"   - Link: {link}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _year_month_label(paper: Any) -> str:
+    published_date = _clean_text(getattr(paper, "published_date", ""))
+    if published_date:
+        m = re.match(r"^(\d{4})(?:-(\d{1,2}))?", published_date)
+        if m:
+            year = m.group(1)
+            month_num = m.group(2)
+            if month_num:
+                month_idx = max(1, min(12, int(month_num)))
+                return f"{year} {datetime.date(1900, month_idx, 1).strftime('%b')}"
+            return year
+
+    year = _clean_text(getattr(paper, "published_at", ""))
+    month = _month_label(getattr(paper, "published_month", ""))
+    return " ".join(part for part in [year, month] if part).strip()
+
+
+def _single_paper_upload_title(paper: Any) -> str:
+    title = _clean_text(getattr(paper, "title", "")) or "Untitled"
+    venue = _clean_text(getattr(paper, "venue", ""))
+    year_month = _year_month_label(paper)
+    detail = ", ".join(part for part in [venue, year_month] if part)
+    return f"{title} ({detail})" if detail else title
+
+
+def _single_paper_upload_description(paper: Any, abstract: str) -> str:
+    abstract_clean = _clean_text(abstract)
+    if abstract_clean:
+        return abstract_clean
+
+    fallback = _clean_text(getattr(paper, "summary", ""))
+    if fallback:
+        return fallback
+
+    title = _clean_text(getattr(paper, "title", ""))
+    return f"Abstract not available for {title}." if title else "Abstract not available."
 
 
 def _normalize_languages(raw_list: List[str]) -> List[str]:
@@ -132,12 +207,145 @@ def _clean_text(text: str) -> str:
     return text.strip().strip(' "“”') if text else ""
 
 
-def _paper_id_from_pdf_url(url: str) -> str:
-    path = url.split("?")[0].split("#")[0]
-    last = path.rstrip("/").split("/")[-1] if path else "custom_pdf"
-    last = last.replace(".pdf", "") if last.endswith(".pdf") else last
-    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", last).strip("_") or "custom_pdf"
+def _month_label(month_raw: Optional[str]) -> str:
+    if not month_raw:
+        return ""
+    text = month_raw.strip().lower().strip("{}")
+    month_map = {
+        "jan": "Jan",
+        "feb": "Feb",
+        "mar": "Mar",
+        "apr": "Apr",
+        "may": "May",
+        "jun": "Jun",
+        "jul": "Jul",
+        "aug": "Aug",
+        "sep": "Sep",
+        "sept": "Sep",
+        "oct": "Oct",
+        "nov": "Nov",
+        "dec": "Dec",
+    }
+    return month_map.get(text, month_raw)
+
+
+def _authors_for_script(authors: List[str]) -> str:
+    cleaned = [_clean_text(a) for a in authors if _clean_text(a)]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    return f"{cleaned[0]} et al."
+
+
+def _sanitize_paper_id(raw: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", (raw or "")).strip("_")
+    return cleaned or "custom_pdf"
+
+
+def _paper_id_from_pdf_path(pdf_path: str) -> str:
+    stem = Path(pdf_path).stem or "custom_pdf"
+    cleaned = _sanitize_paper_id(stem)
     return cleaned
+
+
+def _resolve_local_pdf_inputs(args: argparse.Namespace) -> Tuple[List[str], bool]:
+    if args.doi:
+        raise ValueError("--doi mode does not accept local PDF input flags.")
+
+    if bool(args.pdf_path) == bool(args.input_dir):
+        raise ValueError("Provide exactly one of --pdf-path or --input-dir (or use --doi).")
+
+    if args.pdf_path:
+        pdf_path = os.path.abspath(args.pdf_path)
+        if not os.path.isfile(pdf_path):
+            raise ValueError(f"PDF file not found: {pdf_path}")
+        if not pdf_path.lower().endswith(".pdf"):
+            raise ValueError(f"Input file is not a PDF: {pdf_path}")
+        return [pdf_path], True
+
+    input_dir = os.path.abspath(args.input_dir)
+    if not os.path.isdir(input_dir):
+        raise ValueError(f"Input directory not found: {input_dir}")
+
+    pdf_paths = [
+        os.path.abspath(os.path.join(input_dir, name))
+        for name in sorted(os.listdir(input_dir))
+        if name.lower().endswith(".pdf")
+    ]
+    if not pdf_paths:
+        raise ValueError(f"No PDF files found in input directory: {input_dir}")
+    return pdf_paths, False
+
+
+def _build_local_entry(
+    pdf_path: str,
+    target_date: str,
+    custom_paper_id: Optional[str] = None,
+    custom_title: Optional[str] = None,
+    origin_override: Optional[str] = None,
+) -> HFPaperEntry:
+    paper_id = _sanitize_paper_id(custom_paper_id) if custom_paper_id else _paper_id_from_pdf_path(pdf_path)
+    raw_identifier = Path(pdf_path).stem
+    title = custom_title or raw_identifier.replace("_", " ")
+
+    entry = HFPaperEntry(
+        paper_id=paper_id,
+        title=title,
+        summary=f"Local PDF input from {pdf_path}",
+        authors=[],
+        upvotes=0,
+        published_at=target_date,
+        pdf_path=pdf_path,
+        origin=origin_override,
+    )
+
+    # In local file mode, do not perform metadata lookup.
+    entry.id_type = "filename"
+
+    return entry
+
+
+def _build_entry_from_doi(
+    doi: str,
+    bib_path: str,
+    target_date: str,
+    origin_override: Optional[str] = None,
+) -> HFPaperEntry:
+    normalized_doi = normalize_doi(doi)
+    if not normalized_doi:
+        raise ValueError(f"Invalid DOI: {doi}")
+
+    bib_entry = find_entry_by_doi(bib_path, normalized_doi)
+    if not bib_entry:
+        raise ValueError(f"DOI not found in Better BibTeX file: {normalized_doi}")
+    if not bib_entry.file_path:
+        raise ValueError(f"DOI found but attached file path is missing in Better BibTeX: {normalized_doi}")
+    if not os.path.isfile(bib_entry.file_path):
+        raise ValueError(f"DOI found but PDF file does not exist: {bib_entry.file_path}")
+
+    title = bib_entry.title or normalized_doi
+    paper_id = _sanitize_paper_id(normalized_doi)
+    published_at = bib_entry.published_at or target_date
+
+    return HFPaperEntry(
+        paper_id=paper_id,
+        title=title,
+        summary=f"Loaded from Better BibTeX by DOI ({normalized_doi})",
+        authors=bib_entry.authors,
+        upvotes=0,
+        published_at=published_at,
+        pdf_path=bib_entry.file_path,
+        doi=normalized_doi,
+        venue=bib_entry.venue,
+        published_date=bib_entry.published_at,
+        published_month=bib_entry.published_month,
+        source_url=bib_entry.source_url or doi_url(normalized_doi),
+        id_type="doi",
+        origin=origin_override,
+    )
 
 
 def _write_scripts_file(scripts: List[str], path: str) -> None:
@@ -161,30 +369,34 @@ def _setup_logging(config: Config) -> None:
 def _load_input_papers(
     args: argparse.Namespace,
     target_date: str,
-    top_k: int,
-    config: Config,
+    zotero_bib_path: str,
     origin_override: Optional[str],
 ) -> Tuple[List[HFPaperEntry], bool]:
-    if args.pdf_url:
-        paper_id = args.paper_id or _paper_id_from_pdf_url(args.pdf_url)
-        title = args.paper_title or f"Custom PDF ({paper_id})"
-        paper = HFPaperEntry(
-            paper_id=paper_id,
-            title=title,
-            summary=f"Custom PDF input from {args.pdf_url}",
-            authors=[],
-            upvotes=0,
-            published_at=target_date,
-            pdf_url=args.pdf_url,
-            arxiv_url=None,
-            hf_url=None,
-            origin=origin_override,
+    if args.doi:
+        if args.pdf_path or args.input_dir:
+            raise ValueError("Use either --doi or local PDF input (--pdf-path/--input-dir), not both.")
+        paper = _build_entry_from_doi(
+            doi=args.doi,
+            bib_path=zotero_bib_path,
+            target_date=target_date,
+            origin_override=origin_override,
         )
-        logging.info("Single PDF mode: processing %s (%s)", paper_id, args.pdf_url)
         return [paper], True
 
-    papers = fetch_daily_papers(target_date, top_k, config.hf_base_url)
-    return papers, False
+    pdf_paths, single_pdf_mode = _resolve_local_pdf_inputs(args)
+    papers: List[HFPaperEntry] = []
+
+    for idx, pdf_path in enumerate(pdf_paths):
+        paper = _build_local_entry(
+            pdf_path=pdf_path,
+            target_date=target_date,
+            custom_paper_id=args.paper_id if idx == 0 and single_pdf_mode else None,
+            custom_title=args.paper_title if idx == 0 and single_pdf_mode else None,
+            origin_override=origin_override,
+        )
+        papers.append(paper)
+
+    return papers, single_pdf_mode
 
 
 def _summarize_papers(
@@ -194,30 +406,43 @@ def _summarize_papers(
     llm_client: LLMClient,
     single_pdf_mode: bool,
     origin_override: Optional[str],
-) -> Tuple[List[PaperSummary], Dict[str, FigureLibrary]]:
+    strip_pdf_annotations_flag: bool = False,
+) -> Tuple[List[PaperSummary], Dict[str, FigureLibrary], Dict[str, str]]:
     figure_libraries: Dict[str, FigureLibrary] = {}
     figure_summaries: Dict[str, List[str]] = {}
+    paper_abstracts: Dict[str, str] = {}
     summaries: List[PaperSummary] = []
 
     for paper in papers:
         try:
-            resolved_paper = resolve_arxiv_and_pdf(paper)
-            pdf_path = download_pdf(resolved_paper, target_date, config.output_base_dir)
+            staged_paper = paper
+            pdf_path = stage_local_pdf(staged_paper, target_date, config.output_base_dir)
             if not pdf_path:
                 continue
 
-            captions_path = extract_pdf_figures(pdf_path)
+            parse_pdf_path = pdf_path
+            figure_out_dir: Optional[str] = None
+            if strip_pdf_annotations_flag:
+                parse_pdf_path = strip_pdf_annotations(
+                    pdf_path,
+                    os.path.join(os.path.dirname(pdf_path), "paper.no_annotations.pdf"),
+                )
+                # Keep a dedicated cache dir to avoid mixing with captions extracted from annotated PDFs.
+                figure_out_dir = os.path.join(os.path.dirname(pdf_path), "no_annotations_assets")
+
+            captions_path = extract_pdf_figures(parse_pdf_path, out_dir=figure_out_dir)
             figure_lib = load_figure_library(captions_path) if captions_path else None
             if figure_lib:
-                figure_libraries[resolved_paper.paper_id] = figure_lib
-                figure_summaries[resolved_paper.paper_id] = summarize_assets(figure_lib, limit=20)
+                figure_libraries[staged_paper.paper_id] = figure_lib
+                figure_summaries[staged_paper.paper_id] = summarize_assets(figure_lib, limit=20)
 
-            extracted = extract_core_text(pdf_path)
+            extracted = extract_core_text(parse_pdf_path)
+            paper_abstracts[staged_paper.paper_id] = _clean_text(getattr(extracted, "abstract", ""))
             summary = summarize_paper(
-                resolved_paper,
+                staged_paper,
                 extracted,
                 llm_client,
-                figure_summaries=figure_summaries.get(resolved_paper.paper_id),
+                figure_summaries=figure_summaries.get(staged_paper.paper_id),
             )
             if single_pdf_mode and origin_override:
                 summary.origin = origin_override
@@ -226,7 +451,124 @@ def _summarize_papers(
         except Exception as exc:
             logging.exception("Failed to process paper %s: %s", paper.paper_id, exc)
 
-    return summaries, figure_libraries
+    return summaries, figure_libraries, paper_abstracts
+
+
+def _asset_hint(asset: FigureAsset) -> str:
+    kind = str(asset.asset_type or "Figure").title()
+    if asset.number and asset.page is not None:
+        return f"Page {asset.page}, {kind} {asset.number}"
+    if asset.number:
+        return f"{kind} {asset.number}"
+    if asset.page is not None:
+        return f"Page {asset.page}, {kind}"
+    return kind
+
+
+def _summarize_papers_debug_layout(
+    papers: List[HFPaperEntry],
+    target_date: str,
+    config: Config,
+    single_pdf_mode: bool,
+    origin_override: Optional[str],
+    strip_pdf_annotations_flag: bool = False,
+) -> Tuple[List[PaperSummary], Dict[str, FigureLibrary], Dict[str, str]]:
+    figure_libraries: Dict[str, FigureLibrary] = {}
+    paper_abstracts: Dict[str, str] = {}
+    summaries: List[PaperSummary] = []
+
+    for paper in papers:
+        try:
+            staged_paper = paper
+            pdf_path = stage_local_pdf(staged_paper, target_date, config.output_base_dir)
+            if not pdf_path:
+                continue
+
+            parse_pdf_path = pdf_path
+            figure_out_dir: Optional[str] = None
+            if strip_pdf_annotations_flag:
+                parse_pdf_path = strip_pdf_annotations(
+                    pdf_path,
+                    os.path.join(os.path.dirname(pdf_path), "paper.no_annotations.pdf"),
+                )
+                figure_out_dir = os.path.join(os.path.dirname(pdf_path), "no_annotations_assets")
+
+            captions_path = extract_pdf_figures(parse_pdf_path, out_dir=figure_out_dir)
+            figure_lib = load_figure_library(captions_path) if captions_path else None
+            if not figure_lib:
+                logging.warning("No figure/table assets found for %s", staged_paper.paper_id)
+                continue
+
+            figure_libraries[staged_paper.paper_id] = figure_lib
+
+            sorted_assets = sorted(
+                figure_lib.assets,
+                key=lambda a: (a.page or 0, str(a.asset_type).lower(), str(a.number or "")),
+            )
+            debug_slides = []
+            for asset in sorted_assets:
+                hint = _asset_hint(asset)
+                label = hint
+
+                debug_slides.append(
+                    {
+                        "title": f"Debug Image Only - {label}",
+                        "bullets": [],
+                        "script": "",
+                        "figure_hint": hint,
+                    }
+                )
+                debug_slides.append(
+                    {
+                        "title": f"Debug 3 Bullets + Image - {label}",
+                        "bullets": [
+                            "Debug bullet 1 for layout testing.",
+                            "Debug bullet 2 for layout testing.",
+                            "Debug bullet 3 for layout testing.",
+                        ],
+                        "script": "",
+                        "figure_hint": hint,
+                    }
+                )
+
+            summaries.append(
+                PaperSummary(
+                    paper_id=staged_paper.paper_id,
+                    title=staged_paper.title,
+                    category="Debug",
+                    one_line="Figure/table layout debug deck",
+                    origin=origin_override or staged_paper.origin or "",
+                    authors=staged_paper.authors,
+                    venue=staged_paper.venue,
+                    published_at=staged_paper.published_date or staged_paper.published_at,
+                    published_month=staged_paper.published_month,
+                    key_ideas=[],
+                    insights=[],
+                    slides=[
+                        SlideSpec(
+                            title=raw_slide["title"],
+                            bullets=raw_slide["bullets"],
+                            script=raw_slide["script"],
+                            figure_hint=raw_slide["figure_hint"],
+                        )
+                        for raw_slide in debug_slides
+                    ],
+                )
+            )
+
+            logging.info(
+                "Debug layout mode prepared %d slides for %s (%d assets).",
+                len(debug_slides),
+                staged_paper.paper_id,
+                len(sorted_assets),
+            )
+
+            if single_pdf_mode and origin_override and summaries:
+                summaries[-1].origin = origin_override
+        except Exception as exc:
+            logging.exception("Failed to process paper in debug mode %s: %s", paper.paper_id, exc)
+
+    return summaries, figure_libraries, paper_abstracts
 
 
 def _build_scripts_by_language(
@@ -250,20 +592,37 @@ def _build_scripts_by_language(
 
     if single_pdf_mode and daily.papers:
         paper = daily.papers[0]
-        origin = _clean_text(getattr(paper, "origin", ""))
+        venue = _clean_text(getattr(paper, "venue", ""))
+        published_at = _clean_text(getattr(paper, "published_at", ""))
+        published_month = _month_label(getattr(paper, "published_month", ""))
+        author_phrase = _authors_for_script(getattr(paper, "authors", []))
+        date_phrase = " ".join(part for part in [published_month, published_at] if part).strip()
+
         for lang in target_languages:
             if lang == "ko":
-                origin_phrase = f"{origin}에서 나온 " if origin else ""
-                intro_script = (
-                    f"안녕하세요. NLP 코기입니다. 오늘의 꼬리의 꼬리를 무는 페이퍼 딥다이브, "
-                    f"꼬꼬페에서 다룰 논문은 {origin_phrase}{paper.title}입니다."
-                )
+                details: List[str] = []
+                if venue:
+                    details.append(f"{venue} 저널")
+                if date_phrase:
+                    details.append(f"{date_phrase} 발행")
+                if author_phrase:
+                    details.append(f"저자는 {author_phrase}입니다")
+                detail_sentence = " ".join(details)
+                intro_script = f"안녕하세요. IS Edgar입니다. 오늘 다룰 논문은 {paper.title}입니다."
+                if detail_sentence:
+                    intro_script = f"{intro_script} {detail_sentence}."
             else:
-                origin_phrase = f"from {origin} " if origin else ""
-                intro_script = (
-                    f"Hi everyone. This is NLP Corgi. Today's deep dive is about the paper {origin_phrase}"
-                    f"{paper.title}."
-                )
+                details: List[str] = []
+                if venue:
+                    details.append(f"published in {venue}")
+                if date_phrase:
+                    details.append(f"in {date_phrase}")
+                if author_phrase:
+                    details.append(f"by {author_phrase}")
+                detail_sentence = " ".join(details)
+                intro_script = f"Hi everyone. This is IS Edgar. Today's deep dive is about the paper {paper.title}."
+                if detail_sentence:
+                    intro_script = f"{intro_script} It was {detail_sentence}."
             if scripts_by_lang.get(lang):
                 scripts_by_lang[lang][0] = intro_script
 
@@ -290,7 +649,7 @@ def _render_images(
     single_paper_id: Optional[str],
 ) -> List[str]:
     if args.skip_render:
-        logging.info("Skipping marp rendering step.")
+        logging.info("Skipping Slidev rendering step.")
         return []
 
     image_paths = render_markdown_to_images(
@@ -388,9 +747,11 @@ def _upload_videos(
     skip_upload: bool,
     config: Config,
     papers: List[HFPaperEntry],
+    paper_abstracts: Dict[str, str],
     target_date: str,
     summaries_count: int,
     primary_language: str,
+    single_pdf_mode: bool,
 ) -> None:
     if skip_upload:
         logging.info("Upload skipped by flag.")
@@ -404,14 +765,24 @@ def _upload_videos(
         logging.warning("YouTube credentials missing. Skipping upload.")
         return
 
-    description = build_description(papers, config.hf_base_url)
+    description = build_description(papers)
     multi_language = len(video_paths) > 1
 
     for lang, video_path in video_paths.items():
         title_suffix = "" if (lang == primary_language and not multi_language) else f" [{language_display(lang)}]"
-        title = f"Daily AI Papers - {target_date} | Top {summaries_count} ML Papers{title_suffix}"
-        tags = [target_date, "AI", "Machine Learning", "Research", "Daily Papers", language_display(lang)]
-        per_lang_desc = description if not multi_language else f"Language: {language_display(lang)}\n\n{description}"
+        if single_pdf_mode and papers:
+            primary_paper = papers[0]
+            base_title = _single_paper_upload_title(primary_paper)
+            title = f"{base_title}{title_suffix}"
+            base_desc = _single_paper_upload_description(
+                primary_paper,
+                paper_abstracts.get(primary_paper.paper_id, ""),
+            )
+            per_lang_desc = base_desc if not multi_language else f"Language: {language_display(lang)}\n\n{base_desc}"
+        else:
+            title = f"Information Systems Paper Review - {target_date} | {summaries_count} Paper(s){title_suffix}"
+            per_lang_desc = description if not multi_language else f"Language: {language_display(lang)}\n\n{description}"
+        tags = [target_date, "Information Systems", "Research", "Paper Review", language_display(lang)]
         upload_video(
             video_path,
             title,
@@ -419,6 +790,7 @@ def _upload_videos(
             tags,
             config.youtube_client_secrets,
             config.youtube_token_file,
+            config.youtube_privacy_status,
         )
 
 
@@ -428,30 +800,48 @@ def main() -> int:
     _setup_logging(config)
 
     target_date = args.date or datetime.date.today().isoformat()
-    top_k = args.top_k or config.top_k
     target_languages = _parse_languages(args.languages, config.languages)
     primary_language = target_languages[0] if target_languages else "en"
     origin_override = _clean_text(args.origin) if args.origin else None
 
-    logging.info("Starting pipeline for %s (top_k=%d)", target_date, top_k)
+    logging.info("Starting local PDF pipeline for %s", target_date)
     logging.info("Narration languages: %s", ", ".join(target_languages))
+    if not args.upload:
+        logging.info("YouTube upload disabled by flag.")
     if not config.openai_api_key:
         logging.warning("OPENAI_API_KEY not set. LLM/TTS calls may fail.")
 
-    papers, single_pdf_mode = _load_input_papers(args, target_date, top_k, config, origin_override)
+    try:
+        zotero_bib_path = args.zotero_bib or config.zotero_bib_path
+        papers, single_pdf_mode = _load_input_papers(args, target_date, zotero_bib_path, origin_override)
+    except ValueError as exc:
+        logging.error("%s", exc)
+        return 1
     if not papers:
         logging.error("No papers retrieved. Exiting.")
         return 1
 
-    llm_client = LLMClient(api_key=config.openai_api_key, model=config.openai_llm_model)
-    summaries, figure_libraries = _summarize_papers(
-        papers,
-        target_date,
-        config,
-        llm_client,
-        single_pdf_mode,
-        origin_override,
-    )
+    if args.debug_figure_layout:
+        logging.info("Running in debug figure layout mode (LLM/TTS/video/upload disabled).")
+        summaries, figure_libraries, paper_abstracts = _summarize_papers_debug_layout(
+            papers,
+            target_date,
+            config,
+            single_pdf_mode,
+            origin_override,
+            strip_pdf_annotations_flag=args.strip_pdf_annotations,
+        )
+    else:
+        llm_client = LLMClient(api_key=config.openai_api_key, model=config.openai_llm_model)
+        summaries, figure_libraries, paper_abstracts = _summarize_papers(
+            papers,
+            target_date,
+            config,
+            llm_client,
+            single_pdf_mode,
+            origin_override,
+            strip_pdf_annotations_flag=args.strip_pdf_annotations,
+        )
     if not summaries:
         logging.error("No summaries created. Exiting.")
         return 1
@@ -465,9 +855,18 @@ def main() -> int:
         md_path,
         figure_libraries,
         single_pdf_mode=single_pdf_mode,
+        auto_rotate_by_ocr=args.auto_rotate_by_ocr,
     )
     scripts = _normalize_texts(scripts)
     logging.info("Markdown created at %s", md_path)
+
+    if args.debug_figure_layout:
+        image_paths = _render_images(args, md_path, config.output_base_dir, target_date, single_paper_id)
+        if (not args.skip_render) and (not image_paths):
+            logging.error("Debug slide rendering failed.")
+            return 1
+        logging.info("Debug figure layout mode complete.")
+        return 0
 
     scripts_by_lang = _build_scripts_by_language(
         scripts,
@@ -479,6 +878,10 @@ def main() -> int:
     _write_scripts_by_language(scripts_by_lang, target_date, config.output_base_dir, single_paper_id)
 
     image_paths = _render_images(args, md_path, config.output_base_dir, target_date, single_paper_id)
+    if (not args.skip_render) and (not image_paths):
+        logging.error("Slide rendering failed; stopping before TTS/video to avoid unnecessary API calls.")
+        return 1
+
     audio_by_lang = _generate_audio(args, scripts_by_lang, target_languages, config, target_date, single_paper_id)
     video_paths = _build_videos(
         args,
@@ -494,12 +897,14 @@ def main() -> int:
 
     _upload_videos(
         video_paths,
-        skip_upload=(args.skip_upload or args.video_only),
+        skip_upload=(not args.upload) or args.skip_upload or args.video_only,
         config=config,
         papers=papers,
+        paper_abstracts=paper_abstracts,
         target_date=target_date,
         summaries_count=len(summaries),
         primary_language=primary_language,
+        single_pdf_mode=single_pdf_mode,
     )
 
     logging.info("Pipeline complete.")

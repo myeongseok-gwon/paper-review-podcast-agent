@@ -27,7 +27,7 @@ SYSTEM_PROMPT = (
 def _figures_section(figure_summaries: Optional[List[str]]) -> str:
     if not figure_summaries:
         return "(No pre-extracted figures/tables available.)"
-    lines = ["Available figures/tables (reference by number/type in figure_hint if useful):"]
+    lines = ["Available figures/tables (prefer exact page+label in figure_hint):"]
     for item in figure_summaries:
         lines.append(f"- {item}")
     return "\n".join(lines)
@@ -50,25 +50,33 @@ Audience expectations:
 
 Paper metadata:
 - id: {paper.paper_id}
+- doi: {paper.doi or "n/a"}
 - title: {paper.title}
 - authors: {authors}
+- venue: {paper.venue or "n/a"}
+- published_date: {paper.published_date or paper.published_at or "n/a"}
+- source_url: {paper.source_url or "n/a"}
 - summary: {paper.summary}
-- arxiv: {paper.arxiv_url or "n/a"}
-- pdf: {paper.pdf_url or "n/a"}
+- local_pdf: {paper.pdf_path or "n/a"}
 
 Pre-extracted figures/tables you MAY use:
 {_figures_section(figure_summaries)}
 
 Figure selection guidance:
-- Use at most 5 figures/tables to support the story.
+- Use figures/tables to support the story.
+- Prefer broad coverage: include references to as many core body figures/tables as practical, instead of focusing on only a small subset.
 - Favor:
   • motivation diagrams  
   • architecture/framework/pipeline visuals  
   • summary tables illustrating results  
   • key findings/insights  
+- When you choose a visual, `figure_hint` must be specific and machine-parseable.
+- Preferred `figure_hint` format: "Page X, Figure Y" or "Page X, Table Y".
+- If a number is unavailable but the page is known, use "Page X, Figure" or "Page X, Table".
+- Do not use vague hints like "results chart", "important figure", or "spotlight image".
 - If one figure/table is especially central, create an image-only slide by:
   - omitting bullets, AND
-  - setting figure_hint to that specific asset.
+  - setting figure_hint to that specific asset in the preferred format above.
 - If no figure is appropriate, leave figure_hint empty.
 
 You may insert an image-only spotlight slide anywhere if it improves narrative clarity.
@@ -99,7 +107,7 @@ Your output must strictly follow this structure:
       "title": "string",
       "bullets": ["string"],
       "script": "natural, engaging narration spoken over this slide",
-      "figure_hint": "optional, e.g., 'Figure 4' or 'Table 2'"
+      "figure_hint": "optional, use 'Page X, Figure Y' or 'Page X, Table Y' when visual is used"
     }}
   ]
 }}

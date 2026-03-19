@@ -27,6 +27,13 @@ class HFPaperEntry:
     hf_url: Optional[str] = None
     arxiv_url: Optional[str] = None
     pdf_url: Optional[str] = None
+    pdf_path: Optional[str] = None
+    doi: Optional[str] = None
+    venue: Optional[str] = None
+    published_date: Optional[str] = None
+    published_month: Optional[str] = None
+    source_url: Optional[str] = None
+    id_type: str = "custom"
     origin: Optional[str] = None
 
 

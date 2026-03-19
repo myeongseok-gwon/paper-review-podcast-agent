@@ -1,71 +1,220 @@
-# AutoYouTube
+# Information Systems Paper Review Agent
 
-Automated pipeline that turns **Hugging Face Daily Papers** (or a single PDF) into:
+Automated local pipeline that turns one or more local PDF papers into slides, narration audio, and subtitle-burned videos, with optional YouTube upload.
+
+## Overview
+
+`main.py` orchestrates:
+
+1. Load input PDFs from `--pdf-path` or `--input-dir`.
+2. Infer identifier from filename (or `--paper-id` in single mode).
+3. Detect DOI-like identifiers and enrich metadata using Crossref.
+4. Stage local PDFs into output workspace (`paper.pdf`).
+5. Extract text and optional figures.
+6. Generate structured slide content with LLM.
+7. Render Slidev slides to PNG.
+8. Generate per-slide TTS audio.
+9. Build MP4 videos with hard subtitles.
+10. Optionally upload to YouTube.
+
+## Pipeline
+
+```text
+Local PDF(s)
+  -> Identifier extraction
+  -> DOI detection
+  -> Crossref metadata (if DOI-like)
+  -> Local PDF staging
+  -> Text + figure extraction
+  -> LLM summarization
+  -> Slidev slides
+  -> TTS audio
+  -> Video build
+  -> Optional upload
+```
+
+## Quick Start
+
+```bash
+./scripts/setup_venv.sh
+cp .env.example .env
+source scripts/env.sh
+python main.py --pdf-path "/absolute/path/to/10.1145_1234567.1234568.pdf" --skip-upload
+```
+
+## Usage
+
+### Single local PDF
+
+```bash
+python main.py \
+  --pdf-path "/absolute/path/to/paper.pdf" \
+  --paper-title "Optional custom title" \
+  --origin "Optional affiliation" \
+  --skip-upload
+```
+
+### Batch directory
+
+```bash
+python main.py \
+  --input-dir "/absolute/path/to/papers" \
+  --skip-upload
+```
+
+### Video-only shortcut
+
+```bash
+./scripts/run_video_only.sh --pdf-path "/absolute/path/to/paper.pdf"
+./scripts/run_video_only.sh --input-dir "/absolute/path/to/papers"
+```
+
+## DOI Filename Convention
+
+DOI strings include `/`, which is not valid in filenames. Supported filename stems:
+
+- `10.1145%2F1234567.1234568.pdf` (URL-encoded slash)
+- `10.1145_1234567.1234568.pdf` (first underscore treated as slash)
+
+When DOI is detected, metadata enrichment attempts title, authors, venue, published date, and canonical URL. If lookup fails, pipeline continues with fallback metadata.
+
+## CLI Reference
+
+| Flag | Description |
+| --- | --- |
+| `--date YYYY-MM-DD` | Output grouping date. Defaults to today. |
+| `--languages en,...` | Narration languages. |
+| `--pdf-path PATH` | Process one local PDF file. |
+| `--input-dir PATH` | Process all local `*.pdf` files in a directory. |
+| `--paper-id ID` | Optional custom ID in `--pdf-path` mode. |
+| `--paper-title TITLE` | Optional custom title in `--pdf-path` mode. |
+| `--origin TEXT` | Optional affiliation/origin override. |
+| `--strip-pdf-annotations` | Strip PDF annotations before text/figure extraction (default ON). |
+| `--keep-pdf-annotations` | Keep original PDF annotations during text/figure extraction. |
+| `--skip-render` | Skip Slidev PNG rendering. |
+| `--skip-tts` | Skip TTS generation. |
+| `--skip-video` | Skip video composition. |
+| `--skip-upload` | Skip YouTube upload. |
+| `--no-upload` | Disable YouTube upload. |
+| `--upload` | Enable YouTube upload (default: enabled). |
+| `--video-only` | Build local video and skip upload. |
+
+You must provide exactly one of `--pdf-path` or `--input-dir`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CROSSREF_BASE_URL` | `https://api.crossref.org` | Crossref API base URL for DOI metadata. |
+| `OPENAI_API_KEY` | - | Required for LLM/TTS. |
+| `OPENAI_LLM_MODEL` | `gpt-5.4` | Summarization and translation model. |
+| `OPENAI_TTS_MODEL` | `gpt-4o-mini-tts` | TTS model. |
+| `OPENAI_TTS_VOICE` | `echo` | TTS voice. |
+| `TTS_STYLE_INSTRUCTION` | empty | Optional style hint. |
+| `TTS_SPEED` | `1.2` | TTS speed multiplier. |
+| `LANGUAGES` | `en` | Narration languages. |
+| `YOUTUBE_CLIENT_SECRETS_FILE` | empty | YouTube OAuth client file. |
+| `YOUTUBE_TOKEN_FILE` | empty | YouTube token file. |
+| `YOUTUBE_PRIVACY_STATUS` | `unlisted` | YouTube upload privacy (`public`, `private`, or `unlisted`). |
+| `OUTPUT_BASE_DIR` | `./outputs` | Base output directory. |
+| `LOG_LEVEL` | `INFO` | Log level. |
+| `FIGURE_RENDER_DPI` | `350` | PDF render DPI used before layout detection (higher improves small figure coverage). |
+| `PUBLAYNET_SCORE_THRESH` | `0.6` | Detection confidence threshold for PubLayNet model. |
+| `FIGURE_CROP_PAD_RATIO` | `0.08` | Symmetric crop padding ratio for detected figure/table boxes. |
+| `FIGURE_CROP_PAD_BOTTOM_RATIO` | `0.18` | Extra bottom padding ratio to reduce caption/axis clipping. |
+| `TABLE_CROP_PAD_RATIO` | `0.16` | Left/right padding ratio for table crops. |
+| `TABLE_CROP_PAD_TOP_RATIO` | `0.18` | Extra top padding ratio for table title/header area. |
+| `TABLE_CROP_PAD_BOTTOM_RATIO` | `0.28` | Extra bottom padding ratio for table notes/footers. |
+| `TABLE_FULL_WIDTH_TRIGGER_RATIO` | `0.78` | If table box width/page width exceeds this, expand to near full width. |
+| `TABLE_FULL_WIDTH_MARGIN_RATIO` | `0.04` | Margin ratio kept on both sides for full-width-expanded tables. |
+| `FIGURE_MIN_AREA_RATIO` | `0.0015` | Minimum box area ratio vs page image to filter tiny false positives. |
+| `FIGURE_MIN_SIDE_PX` | `40` | Minimum width/height in pixels for extracted figure crops. |
+
+## Output Layout
+
+Batch mode:
+
+```text
+outputs/{date}/
+  is_papers_review_{date}.mp4
+  is_papers_review_{date}_{lang}.mp4
+  slides/
+    slides_{date}.md
+    slides_{date}_*.png
+    scripts_{date}_{lang}.txt
+  {paper_id}/
+    paper.pdf
+    captions.json
+    figures/*.png
+  audio/{lang}/audio_slide_*.mp3
+```
+
+Single mode:
+
+```text
+outputs/{date}/{paper_id}/
+  paper.pdf
+  captions.json
+  figures/*.png
+  slides/
+    slides_{date}.md
+    slides_{date}_*.png
+    figures/*.png
+  scripts_{date}_{lang}.txt
+  audio/{lang}/audio_slide_*.mp3
+  is_papers_review_{date}.mp4
+  is_papers_review_{date}_{lang}.mp4
+```
+
+## Troubleshooting
+
+- `slidev` missing: `npm i -g @slidev/cli slidev-theme-umn`
+- `ffmpeg` missing: install and verify `ffmpeg -version`
+- Crossref metadata missing: check DOI filename format, record availability, or temporary API/network errors
+# Information Systems Paper Review Agent
+
+Automated local pipeline that turns one or more **local PDF papers** into:
 
 - slide deck images,
 - narrated audio tracks,
 - subtitle-burned MP4 videos,
 - optional YouTube uploads.
 
-The repository is built for daily research-content production with minimal manual steps.
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Pipeline](#pipeline)
-- [Tech Stack](#tech-stack)
-- [Repository Structure](#repository-structure)
-- [Requirements](#requirements)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [CLI Reference](#cli-reference)
-- [Environment Variables](#environment-variables)
-- [Outputs](#outputs)
-- [YouTube Upload Behavior](#youtube-upload-behavior)
-- [Figure Extraction (Optional but Built-in)](#figure-extraction-optional-but-built-in)
-- [Troubleshooting](#troubleshooting)
-- [Publishing Checklist](#publishing-checklist)
-- [Known Limitations](#known-limitations)
-- [License](#license)
+This repository is optimized for **Information Systems paper review workflows** with DOI-aware metadata enrichment.
 
 ## Overview
 
-`main.py` orchestrates a full content pipeline:
+`main.py` orchestrates an end-to-end pipeline:
 
-1. Fetch top papers from Hugging Face Daily Papers (or use `--pdf-url`).
-2. Resolve PDF links and download PDFs.
-3. Extract core paper text (`abstract`, `introduction`, `conclusion`, plus full text).
-4. Ask an LLM for structured slide content in JSON.
-5. Build Marp markdown with modern CSS and optional figure embedding.
-6. Render slides to PNG.
-7. Generate TTS audio per slide and per language.
-8. Compose video with subtitles using MoviePy.
-9. Upload to YouTube (optional).
+1. Load local PDF input (`--pdf-path` or `--input-dir`).
+2. Infer an identifier from filename (or `--paper-id` for single-file mode).
+3. If identifier looks like a DOI, fetch metadata from Crossref.
+4. Stage each local PDF into output workspace.
+5. Extract core paper text (`abstract`, `introduction`, `conclusion`, plus full text).
+6. Ask an LLM for structured slide content in JSON.
+7. Build Slidev markdown with optional figure embedding.
+8. Render slides to PNG.
+9. Generate TTS audio per slide and per language.
+10. Compose video with subtitles using MoviePy.
+11. Upload to YouTube (optional).
 
 ## Pipeline
 
 ```text
-Hugging Face Daily Papers / --pdf-url
-  -> PDF download
+Local PDF(s) (--pdf-path / --input-dir)
+  -> Identifier from filename
+  -> DOI detection
+  -> Crossref metadata fetch (if DOI-like)
+  -> Local PDF staging (paper.pdf)
   -> PDF text + figure extraction
   -> LLM summarization -> slide specs
-  -> Marp markdown generation
-  -> Marp PNG rendering
+  -> Slidev markdown generation
+  -> Slidev PNG rendering
   -> OpenAI TTS (per slide, per language)
   -> MoviePy composition + hard subtitles
   -> MP4 output
   -> Optional YouTube upload
 ```
-
-## Tech Stack
-
-- Python (pipeline orchestration)
-- OpenAI API (LLM summarization, translation, TTS)
-- PyMuPDF (PDF text extraction)
-- Marp CLI (slide rendering)
-- MoviePy + FFmpeg (video composition/encoding)
-- YouTube Data API v3 (upload)
-- Optional: LayoutParser + Detectron2 (figure/table extraction)
 
 ## Repository Structure
 
@@ -73,9 +222,9 @@ Hugging Face Daily Papers / --pdf-url
 main.py                  # Entry point
 config.py                # Env-driven configuration
 
-daily_papers/            # HF fetch + PDF handling + text extraction
+daily_papers/            # Input models, DOI/Crossref metadata, PDF handling, text extraction
 llm/                     # LLM client, prompts, summarizer, translator
-slides/                  # Figure handling, markdown builder, Marp renderer
+slides/                  # Figure handling, markdown builder, Slidev renderer
 tts/                     # OpenAI TTS client
 video/                   # MoviePy video builder + subtitles
 youtube/                 # YouTube OAuth/upload
@@ -90,7 +239,7 @@ models/publaynet/        # PubLayNet config + weights (for figure extraction)
 
 - Python `3.10+` recommended
 - `ffmpeg` on `PATH`
-- `marp` CLI on `PATH`
+- `slidev` CLI on `PATH`
 - OpenAI API key
 
 ### Install Python dependencies
@@ -104,18 +253,18 @@ pip install -r requirements.txt
 ```bash
 # macOS example
 brew install ffmpeg node
-npm i -g @marp-team/marp-cli
+npm i -g @slidev/cli slidev-theme-umn
 ```
 
 ## Quick Start
 
-### 1. Create virtual environment
+### 1) Create virtual environment
 
 ```bash
 ./scripts/setup_venv.sh
 ```
 
-### 2. Configure environment
+### 2) Configure environment
 
 ```bash
 cp .env.example .env
@@ -129,105 +278,129 @@ If uploading to YouTube, also set:
 
 - `YOUTUBE_CLIENT_SECRETS_FILE`
 - `YOUTUBE_TOKEN_FILE`
+- `YOUTUBE_PRIVACY_STATUS` (`public` | `private` | `unlisted`, default: `private`)
 
-Optional but useful to add in `.env`:
-
-```bash
-LANGUAGES=en,ko
-TTS_SPEED=1.2
-TTS_STYLE_INSTRUCTION=
-```
-
-### 3. Activate environment
+### 3) Activate environment
 
 ```bash
 source scripts/env.sh
 ```
 
-### 4. Run pipeline (local video build, no upload)
+### 4) Run pipeline (local video build, no upload)
 
 ```bash
-python main.py --date 2026-02-21 --top-k 10 --skip-upload
+python main.py --pdf-path "/absolute/path/to/10.1145_1234567.1234568.pdf" --skip-upload
 ```
 
 ## Usage
 
-### Daily papers mode
+### Single local PDF mode
 
 ```bash
-python main.py --date 2026-02-21 --top-k 10 --skip-upload
+python main.py \
+  --pdf-path "/absolute/path/to/10.1145_1234567.1234568.pdf" \
+  --paper-title "Optional Custom Title" \
+  --origin "Your Lab/Company" \
+  --skip-upload
 ```
+
+### Batch local directory mode
+
+```bash
+python main.py \
+  --input-dir "/absolute/path/to/papers" \
+  --skip-upload
+```
+
+All `*.pdf` files in the directory are processed.
 
 ### Video-only shortcut (always skips upload)
 
 ```bash
-python main.py --date 2026-02-21 --top-k 10 --video-only
-# or
-./scripts/run_video_only.sh 2026-02-21 10
-```
+# single file
+./scripts/run_video_only.sh --pdf-path "/absolute/path/to/paper.pdf"
 
-### Single PDF mode
-
-```bash
-python main.py \
-  --pdf-url https://arxiv.org/pdf/2511.21689.pdf \
-  --paper-id 2511.21689 \
-  --paper-title "Your Paper Title" \
-  --origin "Your Lab/Company" \
-  --skip-upload
+# batch directory
+./scripts/run_video_only.sh --input-dir "/absolute/path/to/papers"
 ```
 
 ### Partial runs (debug/dev)
 
 ```bash
-python main.py --date 2026-02-21 --skip-render
-python main.py --date 2026-02-21 --skip-tts
-python main.py --date 2026-02-21 --skip-video
+python main.py --pdf-path "/absolute/path/to/paper.pdf" --skip-render
+python main.py --pdf-path "/absolute/path/to/paper.pdf" --skip-tts
+python main.py --pdf-path "/absolute/path/to/paper.pdf" --skip-video
 ```
+
+## DOI Filename Convention
+
+DOI contains `/`, which cannot appear in file names on most systems. Supported patterns:
+
+- URL-encoded DOI stem: `10.1145%2F1234567.1234568.pdf`
+- Filesystem-friendly DOI stem: `10.1145_1234567.1234568.pdf` (first `_` treated as DOI slash)
+- Full DOI URL stem: `https___doi.org_10.1145_1234567.1234568.pdf` is not guaranteed; prefer the two formats above.
+
+If DOI is detected, metadata enrichment attempts:
+
+- title
+- authors
+- venue (journal/proceedings container title)
+- published date
+- canonical URL
+
+If metadata lookup fails, pipeline continues using filename-derived fallback metadata.
 
 ## CLI Reference
 
 | Flag | Description |
 | --- | --- |
-| `--date YYYY-MM-DD` | Target date. Defaults to today. |
-| `--top-k N` | Number of papers to process. Defaults to `TOP_K`/`10`. |
-| `--languages en,ko,...` | Narration languages. First language is primary output video. |
-| `--pdf-url URL` | Process a single PDF instead of Daily Papers fetch. |
-| `--paper-id ID` | Optional custom ID in single-PDF mode. |
-| `--paper-title TITLE` | Optional custom title in single-PDF mode. |
-| `--origin TEXT` | Optional affiliation/origin override for intro narration. |
-| `--skip-render` | Skip Marp PNG rendering. |
+| `--date YYYY-MM-DD` | Output grouping date. Defaults to today. |
+| `--languages en,...` | Narration languages. First language is primary output video. |
+| `--pdf-path PATH` | Process one local PDF file. |
+| `--input-dir PATH` | Process all local `*.pdf` files in a directory. |
+| `--paper-id ID` | Optional custom ID in `--pdf-path` mode. |
+| `--paper-title TITLE` | Optional custom title in `--pdf-path` mode. |
+| `--origin TEXT` | Optional affiliation/origin override. |
+| `--strip-pdf-annotations` | Strip PDF annotations before text/figure extraction (default ON). |
+| `--keep-pdf-annotations` | Keep original PDF annotations during text/figure extraction. |
+| `--skip-render` | Skip Slidev PNG rendering. |
 | `--skip-tts` | Skip TTS generation. |
 | `--skip-video` | Skip video composition. |
 | `--skip-upload` | Disable YouTube upload. |
+| `--no-upload` | Disable YouTube upload. |
+| `--upload` | Enable YouTube upload (default: enabled). |
 | `--video-only` | Build local video and skip upload (same effect as `--skip-upload` for upload phase). |
+
+Input constraints:
+
+- Provide exactly one of `--pdf-path` or `--input-dir`.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `HF_BASE_URL` | `https://huggingface.co` | Hugging Face base URL. |
-| `TOP_K` | `10` | Default top-K paper count. |
+| `CROSSREF_BASE_URL` | `https://api.crossref.org` | Crossref API base URL for DOI lookup. |
 | `OPENAI_API_KEY` | - | Required for LLM/TTS steps. |
-| `OPENAI_LLM_MODEL` | `gpt-5.3` | Model used for summarization and translation. |
+| `OPENAI_LLM_MODEL` | `gpt-5.4` | Model used for summarization and translation. |
 | `OPENAI_TTS_MODEL` | `gpt-4o-mini-tts` | TTS model. |
-| `OPENAI_TTS_VOICE` | `alloy` | Voice preset. |
+| `OPENAI_TTS_VOICE` | `echo` | Voice preset. |
 | `TTS_STYLE_INSTRUCTION` | empty | Style hint string (stored, currently not injected into spoken text). |
 | `TTS_SPEED` | `1.2` | TTS speed multiplier, clamped to `[0.5, 4.0]`. |
-| `LANGUAGES` | `en,ko` | Comma-separated target narration languages. |
+| `LANGUAGES` | `en` | Comma-separated target narration languages. |
 | `YOUTUBE_CLIENT_SECRETS_FILE` | empty | OAuth client JSON path. |
 | `YOUTUBE_TOKEN_FILE` | empty | OAuth token cache path. |
+| `YOUTUBE_PRIVACY_STATUS` | `private` | Upload privacy (`public`, `private`, or `unlisted`). |
 | `OUTPUT_BASE_DIR` | `./outputs` | Base output directory. |
 | `LOG_LEVEL` | `INFO` | Python logging level. |
 
 ## Outputs
 
-### Daily papers mode (`--date`)
+### Batch mode (`--input-dir`)
 
 ```text
 outputs/{date}/
-  daily_papers_{date}.mp4
-  daily_papers_{date}_{lang}.mp4
+  is_papers_review_{date}.mp4
+  is_papers_review_{date}_{lang}.mp4
   slides/
     slides_{date}.md
     slides_{date}_*.png
@@ -241,7 +414,7 @@ outputs/{date}/
     ...
 ```
 
-### Single PDF mode (`--pdf-url`)
+### Single mode (`--pdf-path`)
 
 ```text
 outputs/{date}/{paper_id}/
@@ -251,27 +424,29 @@ outputs/{date}/{paper_id}/
   slides/
     slides_{date}.md
     slides_{date}_*.png
-    figures/*.png          # copied assets used in slide markdown
+    figures/*.png
   scripts_{date}_{lang}.txt
   audio/{lang}/audio_slide_*.mp3
-  daily_papers_{date}.mp4
-  daily_papers_{date}_{lang}.mp4
+  is_papers_review_{date}.mp4
+  is_papers_review_{date}_{lang}.mp4
 ```
 
 ## YouTube Upload Behavior
 
-- Upload occurs only when both conditions are met:
-  - you did not pass `--skip-upload` / `--video-only`
+- Upload runs by default, and occurs only when both conditions are met:
+  - you did not pass `--skip-upload` / `--no-upload` / `--video-only`
   - both `YOUTUBE_CLIENT_SECRETS_FILE` and `YOUTUBE_TOKEN_FILE` are configured
 - First OAuth run opens a local browser for consent.
 - Videos are uploaded as:
-  - `privacyStatus: unlisted`
+  - `privacyStatus: YOUTUBE_PRIVACY_STATUS` (default `private`)
   - `categoryId: 28` (Science & Technology)
-- In multi-language output, title suffix includes language labels (for non-primary tracks).
+- Upload metadata defaults:
+  - Single-paper mode (`--doi` or `--pdf-path`): title is `Paper Title (Venue, Year Mon)` and description is extracted abstract text.
+  - Batch mode (`--input-dir`): title/description use the daily digest format.
 
 ## Figure Extraction (Optional but Built-in)
 
-Figure extraction runs per downloaded PDF before summarization.
+Figure extraction runs per staged local PDF before summarization.
 
 Behavior:
 
@@ -279,31 +454,16 @@ Behavior:
 - If model files or optional deps are missing, extraction is skipped gracefully.
 - Extracted figure/table metadata is fed into the LLM prompt to improve slide quality.
 
-Model/env paths:
-
-- Default model files:
-  - `models/publaynet/config.yaml`
-  - `models/publaynet/model_final.pth`
-- Override via:
-  - `PUBLayNET_CONFIG`
-  - `PUBLayNET_WEIGHTS`
-
-Optional dependencies for this feature are not in `requirements.txt` by default (e.g., `layoutparser`, `detectron2`, `opencv-python`, `numpy`).
-
 ## Troubleshooting
 
-### `marp CLI not found`
-
-Install Marp CLI globally and verify:
+### `slidev CLI not found`
 
 ```bash
-npm i -g @marp-team/marp-cli
-marp --version
+npm i -g @slidev/cli slidev-theme-umn
+slidev --version
 ```
 
 ### FFmpeg / video encoding errors
-
-Install and verify:
 
 ```bash
 ffmpeg -version
@@ -325,41 +485,12 @@ Common causes:
 - `--skip-render` or `--skip-tts` used in ways that leave missing artifacts
 - upstream LLM/TTS failures in logs
 
-### YouTube upload errors
+### Crossref metadata missing
 
-Check:
+Possible causes:
 
-- OAuth client JSON path is valid
-- token path is writable
-- if token is stale, delete token JSON and authenticate again
+- filename does not match supported DOI conventions
+- DOI exists but Crossref record is incomplete
+- transient API/network failure
 
-## Publishing Checklist
-
-Before pushing to GitHub:
-
-- Remove or ignore secrets:
-  - `.env`
-  - OAuth token files
-  - OAuth client secrets
-- Avoid committing large generated artifacts:
-  - `outputs/`
-  - local MP4/PNG/MP3 files
-- Add a proper `.gitignore` if not present.
-- Keep `LICENSE` and `NOTICE` files when redistributing.
-
-## Known Limitations
-
-- No automated test suite is included yet.
-- LLM output quality depends heavily on model behavior and prompt adherence.
-- TTS is generated slide-by-slide; long runs can be costly/time-consuming.
-- Figure extraction quality depends on external model/deps and PDF layout quality.
-
-## License
-
-This project is licensed under the Apache License 2.0. See `LICENSE`.
-
-If you redistribute this project or derivative works, you should:
-
-- include the `LICENSE` file,
-- retain the `NOTICE` file,
-- keep attribution to the original project/author in source or documentation.
+Pipeline continues with fallback metadata even when this happens.
